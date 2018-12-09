@@ -1,8 +1,7 @@
-#include <Wire.h>
 #include <RtcDS3231.h>
 #include <RCSwitch.h>
 #include <EEPROM.h>
-// Using Unified Sensor Libary for DHT22
+// Using Unified Sensor Libary for DHT22 && DHT11
 #include <Adafruit_Sensor.h>
 #include <DHT.h>
 #include <DHT_U.h>
@@ -15,10 +14,16 @@ RtcDateTime currentDateTime;
 RCSwitch RFSwitch = RCSwitch();
 
 // DHT22 Configuration //////////////////
-#define     DHTPIN          2
-#define     DHTTYPE         DHT22
-DHT_Unified DHT_Sensor      (DHTPIN, DHTTYPE);
-sensors_event_t  DHT_Sensor_Event;
+#define           MAX_TEMP        27
+#define           MAX_HUMID       60
+
+//#define           DHTPIN          2
+//#define           DHTTYPE         DHT22
+#define           DHTPIN          2
+#define           DHTTYPE         DHT11
+
+DHT_Unified       DHT_Sensor(DHTPIN, DHTTYPE);
+sensors_event_t   DHT_Sensor_Event;
 
 // STROM ////////////////////////////////
 #define NIKS_STROM      0
@@ -31,6 +36,7 @@ sensors_event_t  DHT_Sensor_Event;
 #define STEUERUNG_ERROR   2
 #define RTC_ERROR         1
 #define DHT22_ERROR       0
+#define DHT11_ERROR       4
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -49,16 +55,20 @@ uint32_t steckdosenCodes[8] = {
 
 bool relaisStatus[6];                    // [0, 1, 2, 3] Lichter; [4, 5] Lüfter
 bool shortTimeActive            = false; // Standardmäßig in die Wachstumsphase
+
+// Safety features
+bool lightsAreCorrect           = false;
+bool fansAreTurning             = false;
+bool measurementsBelowMax       = false;
+
 bool errorIndexOverflow         = false;
 bool messungsIndexOverflow      = false;
 bool relaisChangeIndexOverflow  = false;
-bool lightsAreCorrect           = false;
-bool fansAreTurning             = false;
 
-uint8_t fanSpeedMeasurements  = 0;
+uint8_t fanSpeedMeasurements  = 5;
 uint8_t errorIndex            = 0;
 uint8_t relaisChangeIndex     = 0;
-uint8_t loopCounter           = 5;
+uint8_t loopCounter           = 0;
 
 uint8_t lightsOnStartHH[2]    = {  4, 10 }; // { longStart, shortStart }
 uint8_t lightsOnEndHH[2]      = { 22, 22 }; // { longEnd,   shortEnd }
@@ -66,11 +76,14 @@ uint8_t fanTachoPins[4]       = {  2,  3, 4, 5 };
 
 uint32_t CURRENT_TIME               = 0;
 uint32_t FLOWERCYCLE_BEGIN          = 1544049215; // 05.12.2018 22:13:20
-uint32_t fanSpeedMeasurementTimeOut = (4294967000 / fanSpeedMeasurements);
+
+uint32_t fanSpeedMeasurementTimeOut = (4294967000 / (2 * fanSpeedMeasurements));
 uint32_t fanSpeedOnThreshold        = 100;
 uint32_t currentUnixTime            = 0;
+uint32_t lastUnixTime               = 0;
 uint32_t lightsSwitchUnixTime       = 0;
-uint32_t ledCooloffTime             = 60; // 1 Minute
+//uint32_t ledCooloffTime             = 60; // 1 Minute
+// Nach ausschalten der LED's Lüfter für 1 Minute weiter drehen lassen um LED's abzukühlen
 
 struct Messung {
   float           temperatur;
@@ -180,6 +193,47 @@ bool readDHT22() {
 
   // Falls auslesen erfolgreich, Messung eintragen.
   addMessung(temperatur, feuchtigkeit);
+
+  // Überprüfen ob gemessene Werte Grenzwerte überschreiten
+  if (temperatur < MAX_TEMP && feuchtigkeit < MAX_HUMID) {
+    measurementsBelowMax = true;
+  } else { measurementsBelowMax = false }
+
+  // Messung war erfolgreich
+  return true;
+}
+
+bool readDHT11() {
+  float feuchtigkeit  = 0.0f;
+  float temperatur    = 0.0f;
+
+  // Temperatur auslesen
+  DHT_Sensor.temperature().getEvent(&DHT_Sensor_Event);
+  if (!isnan(DHT_Sensor_Event.temperature)) {
+    temperatur = DHT_Sensor_Event.temperature;
+  } else { // Temperatur konnte nicht ausgelesen werden
+    addError(DHT22_ERROR, 0);
+    return false;
+  }
+
+  // Feuchtigkeit auslesen
+  DHT_Sensor.humidity().getEvent(&DHT_Sensor_Event);
+  if (!isnan(DHT_Sensor_Event.relative_humidity)) {
+    feuchtigkeit = DHT_Sensor_Event.relative_humidity;
+  } else { // Feuchtigkeit konnte nicht ausgelesen werden
+    addError(DHT22_ERROR, 0);
+    return false;
+  }
+
+  // Falls auslesen erfolgreich, Messung eintragen.
+  addMessung(temperatur, feuchtigkeit);
+
+  // Überprüfen ob gemessene Werte Grenzwerte überschreiten
+  if (temperatur < MAX_TEMP && feuchtigkeit < MAX_HUMID) {
+    measurementsBelowMax = true;
+  } else { measurementsBelowMax = false }
+
+  // Messung war erfolgreich
   return true;
 }
 
@@ -252,7 +306,9 @@ bool changeLights() { // Whether lights should be on or off dependent on current
   if (shortTimeActive) shortTimeActiveArr++;
 
   //Licht Steuerung
-  if (currentHH > lightsOnStartHH[shortTimeActiveArr] && currentHH < lightsOnEndHH[shortTimeActiveArr]) {
+  if (measurementsBelowMax                            &&    // Feuchtigkeit und Temperatur sind unter den Grenzwerten
+      currentHH > lightsOnStartHH[shortTimeActiveArr] &&
+      currentHH < lightsOnEndHH[shortTimeActiveArr]     ) {
     // LICHD MUSS ANN
     if (!fansAreTurning) {
       relaisChange(LUEFTER_STROM, true);
@@ -287,12 +343,14 @@ void controlLoop() {
 }
 
 void loopCounterManagement() { // Measure DHT22 every 2 seconds
-  if (loopCounter % 2 == 1) readDHT22();
-  ++loopCounter;
-  if (loopCounter % 2 == 0) loopCounter = 0;
+  //if (loopCounter % 2 == 1) readDHT22();
+  //++loopCounter;
+  //if (loopCounter % 2 == 0) loopCounter = 0;
+  
+  readDHT11();  
 }
 
-void printCurrentSystemStatus() {
+void printCurrentSystemState() {
   Serial.print("Errors: ");
   Serial.println(errorIndex);
   Serial.println("");
@@ -321,6 +379,8 @@ void printCurrentSystemStatus() {
   Serial.println(currentDateTime.Minute());
   Serial.println("");
 }
+
+bool
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
